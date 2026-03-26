@@ -1,190 +1,154 @@
-# ===============================
-# Windows Ultimate Reset and Repair TUI
-# ===============================
+<#
 
-$logFile = "$env:USERPROFILE\Desktop\UltimateRepairLog_$(Get-Date -Format yyyyMMdd_HHmmss).txt"
+    #>
 
-function Write-Log {
-    param([string]$Message)
-    Add-Content -Path $logFile -Value "$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')) - $Message"
+# 1. Administrative Enforcement
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "Elevation required. Restarting as Administrator..." -ForegroundColor Yellow
+    Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
+    Exit
 }
 
-function Show-Menu {
-    Clear-Host
-    Write-Host "==========================" -ForegroundColor Cyan
-    Write-Host "  Windows Ultimate Reset and Repair  " -ForegroundColor Cyan
-    Write-Host "==========================" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "Options:" -ForegroundColor Yellow
-    Write-Host "1. Repair Network"
-    Write-Host "2. System Repair (DISM, SFC, MCBUILD)"
-    Write-Host "3. Clean Temporary Files & Cache"
-    Write-Host "4. Reset Windows Update Components"
-    Write-Host "5. Run Health Diagnostics"
-    Write-Host "6. Exit"
-    Write-Host ""
+$logFile = "$env:USERPROFILE\Desktop\SystemRepairLog_$(Get-Date -Format yyyyMMdd).log"
+
+# --- Helper Functions ---
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "[$timestamp] [$Level] $Message" | Out-File -FilePath $logFile -Append
+}
+
+function Invoke-Action {
+    param (
+        [string]$Description,
+        [scriptblock]$ScriptBlock
+    )
+    Write-Host "`n[*] $Description..." -ForegroundColor Cyan
+    Write-Log "Executing: $Description"
+    try {
+        & $ScriptBlock
+        Write-Host "[+] Success" -ForegroundColor Green
+        Write-Log "Success: $Description"
+    }
+    catch {
+        Write-Host "[-] Failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Log "Error: $($_.Exception.Message)" "ERROR"
+    }
 }
 
 function Create-RestorePoint {
-    Write-Host "Creating system restore point..." -ForegroundColor Magenta
-    Write-Log "Creating system restore point."
+    Write-Host "Checking System Restore status..." -ForegroundColor Magenta
     try {
-        Checkpoint-Computer -Description "PreRepairRestorePoint" -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
-        Write-Host "Restore point created successfully." -ForegroundColor Green
-        Write-Log "Restore point created successfully."
+        # Check if System Protection is enabled
+        if ((Get-ComputerRestorePoint).Count -eq 0 -or $true) {
+            Enable-ComputerRestore -Drive "C:\" -ErrorAction SilentlyContinue
+            Checkpoint-Computer -Description "PreRepair_$(Get-Date -Format HHmm)" -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
+            Write-Host "[+] Restore point created." -ForegroundColor Green
+        }
     }
     catch {
-        Write-Host "Failed to create restore point: $_" -ForegroundColor Red
-        Write-Log "Failed to create restore point: $_"
+        Write-Host "[!] Restore point skipped (standard 24hr limit or disabled)." -ForegroundColor Yellow
     }
 }
 
-function Show-Progress {
-    param([string]$Message)
-    for ($i=0; $i -le 100; $i+=20) {
-        Write-Progress -Activity $Message -Status "$i% Complete" -PercentComplete $i
-        Start-Sleep -Milliseconds 200
-    }
-    Write-Progress -Activity $Message -Completed
-}
-
-function Run-Command {
-    param (
-        [string]$Desc,
-        [string]$Cmd
-    )
-    Write-Host "`nDoing: $Desc" -ForegroundColor Yellow
-    Write-Host "Running command: $Cmd" -ForegroundColor Cyan
-    Write-Log "Doing: $Desc | Command: $Cmd"
-
-    try {
-        $output = Invoke-Expression $Cmd
-        Write-Host "Output: $output" -ForegroundColor Gray
-        Write-Host "Status: Successful" -ForegroundColor Green
-        Write-Log "Status: Successful | Output: $output"
-    }
-    catch {
-        Write-Host "Status: Failed - $_" -ForegroundColor Red
-        Write-Log "Status: Failed - $_"
-    }
-}
+# --- Core Logic Functions ---
 
 function Repair-Network {
     Create-RestorePoint
-    Clear-Host
-    Write-Host "Repairing Network..." -ForegroundColor Green
-
-    $networkCmds = @(
-        @{Desc="Resetting Winsock"; Cmd="netsh winsock reset"},
-        @{Desc="Resetting IP stack"; Cmd="netsh int ip reset"},
-        @{Desc="Releasing IP"; Cmd="ipconfig /release"},
-        @{Desc="Renewing IP"; Cmd="ipconfig /renew"},
-        @{Desc="Flushing DNS"; Cmd="ipconfig /flushdns"},
-        @{Desc="Registering DNS"; Cmd="ipconfig /registerdns"},
-        @{Desc="Clearing ARP cache"; Cmd="arp -d *"},
-        @{Desc="Resetting NetBIOS over TCP/IP"; Cmd="nbtstat -R"},
-        @{Desc="Re-registering NetBIOS names"; Cmd="nbtstat -RR"}
+    $cmds = @(
+        { netsh winsock reset },
+        { netsh int ip reset },
+        { ipconfig /release },
+        { ipconfig /renew },
+        { ipconfig /flushdns },
+        { nbtstat -R },
+        { nbtstat -RR },
+        { netsh advfirewall reset }
     )
-
-    $jobs = @()
-    foreach ($cmd in $networkCmds) {
-        $jobs += Start-Job -ScriptBlock { param($d,$c) Show-Progress "Executing $d"; Run-Command $d $c } -ArgumentList $cmd.Desc, $cmd.Cmd
-    }
-    $jobs | Wait-Job | Receive-Job
-    Remove-Job -State Completed
-    Write-Host "`nNetwork repair completed." -ForegroundColor Green
+    
+    foreach ($c in $cmds) { Invoke-Action "Network Stack Optimization" $c }
+    Write-Host "`nNetwork repair complete. A reboot is recommended." -ForegroundColor Green
     Pause
 }
 
 function Repair-System {
     Create-RestorePoint
-    Clear-Host
-    Write-Host "System Repair..." -ForegroundColor Green
-
-    $systemCmds = @(
-        @{Desc="Running DISM online repair"; Cmd="DISM /Online /Cleanup-Image /RestoreHealth"},
-        @{Desc="Running System File Checker"; Cmd="sfc /scannow"},
-        @{Desc="Rebuilding MCB database"; Cmd="mcbuilder"}
-    )
-
-    foreach ($cmd in $systemCmds) {
-        Show-Progress "Executing $($cmd.Desc)"
-        Run-Command $cmd.Desc $cmd.Cmd
-    }
-    Write-Host "`nSystem repair completed." -ForegroundColor Green
+    Invoke-Action "DISM Component Store Repair" { DISM /Online /Cleanup-Image /RestoreHealth }
+    Invoke-Action "SFC System File Verification" { sfc /scannow }
+    Invoke-Action "MCBuilder Optimization" { mcbuilder }
     Pause
 }
 
 function Clean-TempFiles {
-    Create-RestorePoint
-    Clear-Host
-    Write-Host "Cleaning Temporary Files..." -ForegroundColor Green
-
-    $tempCmds = @(
-        @{Desc="Cleaning temp folder"; Cmd="Remove-Item -Path $env:TEMP\* -Recurse -Force -ErrorAction SilentlyContinue"},
-        @{Desc="Cleaning Windows temp"; Cmd="Remove-Item -Path C:\Windows\Temp\* -Recurse -Force -ErrorAction SilentlyContinue"},
-        @{Desc="Cleaning Prefetch"; Cmd="Remove-Item -Path C:\Windows\Prefetch\* -Recurse -Force -ErrorAction SilentlyContinue"}
-    )
-
-    foreach ($cmd in $tempCmds) {
-        Show-Progress "Executing $($cmd.Desc)"
-        Run-Command $cmd.Desc $cmd.Cmd
+    $targets = @("$env:TEMP\*", "C:\Windows\Temp\*", "C:\Windows\Prefetch\*")
+    foreach ($path in $targets) {
+        Invoke-Action "Cleaning $path" { 
+            Get-ChildItem -Path $path -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue 
+        }
     }
-    Write-Host "`nTemporary files cleaned." -ForegroundColor Green
     Pause
 }
 
 function Reset-WindowsUpdate {
     Create-RestorePoint
-    Clear-Host
-    Write-Host "Resetting Windows Update Components..." -ForegroundColor Green
-
-    $wuCmds = @(
-        @{Desc="Stopping Windows Update services"; Cmd="net stop wuauserv & net stop bits & net stop cryptsvc & net stop msiserver"},
-        @{Desc="Renaming SoftwareDistribution folder"; Cmd="Rename-Item C:\Windows\SoftwareDistribution SoftwareDistribution.old -Force"},
-        @{Desc="Renaming Catroot2 folder"; Cmd="Rename-Item C:\Windows\System32\catroot2 catroot2.old -Force"},
-        @{Desc="Restarting Windows Update services"; Cmd="net start wuauserv & net start bits & net start cryptsvc & net start msiserver"}
-    )
-
-    foreach ($cmd in $wuCmds) {
-        Show-Progress "Executing $($cmd.Desc)"
-        Run-Command $cmd.Desc $cmd.Cmd
+    $services = @("wuauserv", "bits", "cryptsvc", "msiserver")
+    
+    Invoke-Action "Stopping Update Services" {
+        foreach ($s in $services) { 
+            Stop-Service -Name $s -Force -ErrorAction SilentlyContinue 
+        }
     }
-    Write-Host "`nWindows Update reset completed." -ForegroundColor Green
+
+    # Handle file locks with a brief wait
+    Start-Sleep -Seconds 2
+
+    Invoke-Action "Renaming SoftwareDistribution" {
+        if (Test-Path "C:\Windows\SoftwareDistribution") {
+            $stamp = Get-Date -Format "yyyyMMddHHmm"
+            Rename-Item -Path "C:\Windows\SoftwareDistribution" -NewName "SoftwareDistribution.old.$stamp" -Force
+        }
+    }
+
+    Invoke-Action "Restarting Services" {
+        foreach ($s in $services) { 
+            Start-Service -Name $s -ErrorAction SilentlyContinue 
+        }
+    }
     Pause
 }
 
 function Run-HealthDiagnostics {
-    Clear-Host
-    Write-Host "Running Health Diagnostics..." -ForegroundColor Green
-
-    # Disk health
-    Show-Progress "Checking disk health"
-    Run-Command "Check disk health" "chkdsk C: /F /R"
-
-    # Network ping
-    Show-Progress "Testing network connectivity"
-    Run-Command "Ping google.com" "ping google.com"
-
-    # DNS resolution test
-    Show-Progress "Testing DNS resolution"
-    Run-Command "Resolve DNS for microsoft.com" "nslookup microsoft.com"
-
-    Write-Host "`nHealth diagnostics completed." -ForegroundColor Green
+    Invoke-Action "DNS Integrity Check" { Resolve-DnsName google.com -QuickRuntime }
+    Invoke-Action "Disk Health Analysis" { Get-PhysicalDisk | Select-Object DeviceID, FriendlyName, OperationalStatus, HealthStatus }
+    Write-Host "`n[!] To run a full CHKDSK, the system must reboot." -ForegroundColor Yellow
+    $confirm = Read-Host "Schedule CHKDSK on next reboot? (y/n)"
+    if ($confirm -eq 'y') { chkdsk C: /f }
     Pause
 }
 
-# Main loop
+# --- TUI Logic ---
+
 do {
-    Show-Menu
-    $choice = Read-Host "Select an option (1-6)"
+    Clear-Host
+    Write-Host "==============================================" -ForegroundColor Cyan
+    Write-Host "   WINDOWS ULTIMATE REPAIR TUI (v2.0)         " -ForegroundColor Cyan
+    Write-Host "==============================================" -ForegroundColor Cyan
+    Write-Host " 1. Repair Network Stack"
+    Write-Host " 2. System Integrity Repair (DISM/SFC)"
+    Write-Host " 3. Deep Clean Temp/Cache"
+    Write-Host " 4. Full Reset Windows Update"
+    Write-Host " 5. Diagnostics & Disk Check"
+    Write-Host " 6. Exit"
+    Write-Host "----------------------------------------------"
+    
+    $choice = Read-Host "Command"
     switch ($choice) {
         "1" { Repair-Network }
         "2" { Repair-System }
         "3" { Clean-TempFiles }
         "4" { Reset-WindowsUpdate }
         "5" { Run-HealthDiagnostics }
-        "6" { Write-Host "Exiting..."; break }
-        default { Write-Host "Invalid option, try again." -ForegroundColor Red; Start-Sleep -Seconds 1 }
+        "6" { Exit }
     }
 } while ($true)
